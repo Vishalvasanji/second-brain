@@ -1,0 +1,83 @@
+# Second Brain v2 Configuration
+
+# Core paths
+memory_dir: ~/workspace/memory
+session_dir: ~/.openclaw/agents/main/sessions  
+memory_md: ~/workspace/MEMORY.md
+
+# Consolidation settings
+consolidation:
+  interval_days: 7           # How many days back to consolidate
+  dry_run: true             # Always preview before applying changes
+  min_score: 0.5            # Minimum memory score to include
+  backup_memory_md: true    # Create .bak files before changes
+  categories:               # Memory categories to extract
+    - facts
+    - decisions
+    - preferences  
+    - action_items
+    - technical_details
+    - people_mentioned
+    - key_topics
+
+# Memory scoring algorithm
+scoring:
+  decay_half_life_days: 14  # How fast memories decay (14 = half relevance after 2 weeks)
+  category_weights:         # Importance multipliers by category
+    decisions: 1.5
+    preferences: 1.3  
+    facts: 1.0
+    action_items: 1.2
+    technical_details: 1.1
+    people_mentioned: 1.0
+    key_topics: 0.9
+    transient: 0.5
+  frequency_boost: 1.2      # Boost for memories mentioned multiple times
+  max_score: 5.0           # Cap maximum scores
+
+# Search configuration  
+search:
+  use_qmd: true            # Use qmd if available, fallback to BM25
+  fallback: bm25           # Fallback search method
+  max_results: 10          # Default result limit
+  highlight_matches: true  # Highlight search terms in results
+  min_score_threshold: 0.1 # Filter very low relevance results
+  date_boost_recent_days: 7 # Boost results from last N days
+
+# Extraction settings
+extraction:
+  model: claude-sonnet-4-20250514
+  max_tokens_per_chunk: 100000
+  target_chars_per_chunk: 300000
+  extract_entities: true    # Extract people, projects, tools
+  structured_output: true   # Generate .json alongside .md
+  chunk_overlap: 1000      # Character overlap between chunks
+
+# Pipeline automation
+pipeline:
+  extract_recent: true      # Extract from recent sessions
+  update_scores: true       # Recalculate memory scores  
+  update_qmd: true         # Update qmd search index
+  consolidate: false       # Auto-consolidate (dangerous - use dry_run)
+  generate_report: true    # Create nightly pipeline report
+  consolidate_threshold: 5 # Min new memories before consolidation
+  max_runtime_minutes: 30  # Pipeline timeout
+
+# Claude API settings
+api:
+  model: claude-sonnet-4-20250514
+  max_retries: 3
+  timeout_seconds: 120
+  temperature: 0.1         # Low temperature for consistent extraction
+
+# Output formatting
+output:
+  timestamp_format: "%Y-%m-%d %H:%M:%S"
+  max_snippet_chars: 300
+  context_lines: 2         # Lines of context around matches
+  
+# Debug and logging
+debug:
+  verbose: false
+  log_api_calls: false
+  save_intermediate_files: false
