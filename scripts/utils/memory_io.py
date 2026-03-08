@@ -1,287 +1,260 @@
 #!/usr/bin/env python3
-"""
-Memory I/O utilities for Second Brain v2
+"""Memory path/config helpers for local git-backed Second Brain."""
 
-Handles reading/writing memory files, API key management, and file operations.
-"""
+from __future__ import annotations
 
+import hashlib
 import json
-import os
-import yaml
-from datetime import datetime, date
+from datetime import date, datetime
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Tuple
-import shutil
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+try:
+    import yaml  # type: ignore
+except Exception:  # pragma: no cover
+    yaml = None
+
+
+def _tiny_yaml_parse(text: str) -> Dict[str, Any]:
+    """Very small YAML subset parser used only when PyYAML is unavailable."""
+    root: Dict[str, Any] = {}
+    stack: List[tuple[int, Dict[str, Any] | List[Any]]] = [(0, root)]
+    for raw in text.splitlines():
+        if not raw.strip() or raw.strip().startswith("#"):
+            continue
+        indent = len(raw) - len(raw.lstrip(" "))
+        line = raw.strip()
+        while len(stack) > 1 and indent < stack[-1][0]:
+            stack.pop()
+        container = stack[-1][1]
+        if line.startswith("- "):
+            if isinstance(container, list):
+                container.append(line[2:].strip().strip('"'))
+            continue
+        if ":" not in line or not isinstance(container, dict):
+            continue
+        key, value = [x.strip() for x in line.split(":", 1)]
+        if value == "":
+            # next indented lines define map or list
+            nxt: Dict[str, Any] = {}
+            container[key] = nxt
+            stack.append((indent + 2, nxt))
+        else:
+            low = value.lower()
+            if low in {"true", "false"}:
+                v: Any = low == "true"
+            else:
+                try:
+                    v = int(value)
+                except ValueError:
+                    try:
+                        v = float(value)
+                    except ValueError:
+                        v = value.strip('"')
+            container[key] = v
+
+        # convert empty dict containers to list if first child starts with '- '
+        if isinstance(container, dict) and key in container and isinstance(container[key], dict):
+            maybe_list = container[key]
+            if maybe_list == {} and any(l.startswith(" " * (indent + 2) + "- ") for l in text.splitlines()):
+                container[key] = []
+                stack[-1] = (stack[-1][0], container)
+                stack.append((indent + 2, container[key]))
+    return root
 
 
 def load_config(config_path: Optional[Path] = None) -> Dict[str, Any]:
-    """Load configuration from YAML file."""
     if config_path is None:
-        config_path = Path(__file__).parent.parent.parent / "config.yaml"
-    
-    if not config_path.exists():
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-    
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
-    
-    # Expand paths
-    for key, value in config.items():
-        if key.endswith('_dir') or key.endswith('_md'):
-            if isinstance(value, str) and value.startswith('~'):
-                config[key] = str(Path(value).expanduser())
-    
-    return config
+        config_path = Path(__file__).resolve().parents[2] / "config.yaml"
+    text = Path(config_path).read_text(encoding="utf-8")
+    if yaml:
+        cfg = yaml.safe_load(text) or {}
+    else:
+        cfg = _tiny_yaml_parse(text)
+
+    for k in ["memory_dir", "session_dir", "memory_md"]:
+        if isinstance(cfg.get(k), str):
+            cfg[k] = str(Path(cfg[k]).expanduser())
+
+    index_cfg = cfg.setdefault("index", {})
+    index_dir = Path(index_cfg.get("dir", ".index"))
+    index_cfg["dir"] = str(index_dir)
+    index_cfg.setdefault("faiss_path", str(index_dir / "vectors.faiss"))
+    index_cfg.setdefault("sqlite_path", str(index_dir / "chunks.sqlite"))
+    index_cfg.setdefault("manifest_path", str(index_dir / "manifest.json"))
+    index_cfg.setdefault("graph_path", str(index_dir / "graph.sqlite"))
+
+    cfg.setdefault("ollama", {})
+    cfg["ollama"].setdefault("host", "http://localhost:11434")
+    cfg["ollama"].setdefault("embedding_model", "nomic-embed-text")
+    cfg["ollama"].setdefault("generation_model", "llama3.2")
+
+    cfg.setdefault("memory", {})
+    cfg["memory"].setdefault("daily_globs", ["*.md", "daily/*.md"])
+    cfg["memory"].setdefault("archives_dir", "archives")
+    cfg["memory"].setdefault("agents_dir", "agents")
+    cfg["memory"].setdefault("handbook_dir", "handbook")
+    cfg["memory"].setdefault("lessons_file", "lessons-learned.md")
+
+    cfg.setdefault("search", {})
+    cfg["search"].setdefault("max_results", 10)
+    cfg["search"].setdefault("ranking_weights", {
+        "similarity": 0.68,
+        "authority": 0.18,
+        "recency": 0.10,
+        "scope": 0.08,
+        "archive_penalty": 0.04,
+    })
+
+    cfg.setdefault("compaction", {})
+    cfg["compaction"].setdefault("enabled", True)
+    cfg["compaction"].setdefault("max_memory_md_bytes", 240000)
+    cfg["compaction"].setdefault("max_memory_md_tokens", 50000)
+    cfg["compaction"].setdefault("weekly_schedule_enabled", True)
+    cfg["compaction"].setdefault("weekly_day", "sunday")
+    cfg["compaction"].setdefault("compaction_version", "v1")
+
+    return cfg
 
 
-def get_api_key() -> str:
-    """Get Anthropic API key from environment or auth profiles."""
-    # Try environment variable first
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if api_key:
-        return api_key
-
-    # Try auth profiles
-    auth_profiles_path = Path.home() / ".openclaw/agents/main/agent/auth-profiles.json"
-    try:
-        if auth_profiles_path.exists():
-            with open(auth_profiles_path, 'r') as f:
-                data = json.load(f)
-                profiles = data.get("profiles", data)
-                if "anthropic:default" in profiles:
-                    token = profiles["anthropic:default"].get("token")
-                    if token:
-                        return token
-    except Exception as e:
-        print(f"Warning: Could not read auth profiles: {e}")
-
-    raise ValueError("No API key found. Set ANTHROPIC_API_KEY or configure auth profile.")
+def sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def get_memory_files(memory_dir: Path, date_range: Optional[Tuple[date, date]] = None) -> List[Path]:
-    """Get all memory files, optionally filtered by date range."""
-    memory_dir = Path(memory_dir)
-    if not memory_dir.exists():
-        return []
-    
-    files = []
-    for file_path in memory_dir.glob("*.md"):
-        # Skip files that start with . (indexes, etc.)
-        if file_path.name.startswith('.'):
-            continue
-            
-        # Try to parse date from filename (YYYY-MM-DD.md format)
-        try:
-            file_date = datetime.strptime(file_path.stem, "%Y-%m-%d").date()
-            if date_range is None or (date_range[0] <= file_date <= date_range[1]):
-                files.append(file_path)
-        except ValueError:
-            # Not a date-formatted file, include it anyway
-            files.append(file_path)
-    
-    return sorted(files)
+def read_text(path: Path) -> str:
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
 
 
-def read_memory_file(file_path: Path) -> Dict[str, Any]:
-    """Read a memory file and return structured data."""
-    if not file_path.exists():
-        return {"path": str(file_path), "content": "", "sections": {}}
-    
-    with open(file_path, 'r', encoding='utf-8') as f:
-        content = f.read()
-    
-    # Parse sections if it's a structured memory file
-    sections = parse_memory_sections(content)
-    
-    # Get file metadata
-    stat = file_path.stat()
-    
-    return {
-        "path": str(file_path),
-        "content": content,
-        "sections": sections,
-        "size": stat.st_size,
-        "modified": datetime.fromtimestamp(stat.st_mtime),
-        "created": datetime.fromtimestamp(stat.st_ctime)
-    }
-
-
-def parse_memory_sections(content: str) -> Dict[str, List[str]]:
-    """Parse memory file into structured sections."""
-    sections = {}
-    current_section = None
-    current_items = []
-    
-    for line in content.split('\n'):
-        line = line.strip()
-        if not line:
-            continue
-            
-        # Check for section headers (## Section Name)
-        if line.startswith('## '):
-            if current_section:
-                sections[current_section] = current_items
-            current_section = line[3:].strip().lower().replace(' ', '_')
-            current_items = []
-        elif line.startswith('- ') and current_section:
-            # Remove the leading "- " and add to current section
-            item = line[2:].strip()
-            if item and item != "None":
-                current_items.append(item)
-    
-    # Don't forget the last section
-    if current_section:
-        sections[current_section] = current_items
-    
-    return sections
-
-
-def write_memory_file(file_path: Path, content: str, backup: bool = True) -> None:
-    """Write content to memory file with optional backup."""
-    file_path = Path(file_path)
-    
-    # Create backup if file exists
-    if backup and file_path.exists():
-        backup_path = file_path.with_suffix(f"{file_path.suffix}.bak")
-        shutil.copy2(file_path, backup_path)
-    
-    # Ensure directory exists
-    file_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    # Write content
-    with open(file_path, 'w', encoding='utf-8') as f:
+def write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
         f.write(content)
 
 
-def load_memory_index(memory_dir: Path) -> Dict[str, Any]:
-    """Load the memory scoring index."""
-    index_path = Path(memory_dir) / ".memory-index.json"
-    if not index_path.exists():
-        return {"memories": {}, "last_updated": None, "version": "1.0"}
-    
+def _collect_glob(base: Path, patterns: Iterable[str]) -> List[Path]:
+    out: List[Path] = []
+    for pattern in patterns:
+        out.extend(base.glob(pattern))
+    return out
+
+
+def gather_memory_files(
+    config: Dict[str, Any],
+    scope: str = "shared",
+    agent: Optional[str] = None,
+    date_range: Optional[Tuple[date, date]] = None,
+) -> List[Dict[str, Any]]:
+    memory_dir = Path(config["memory_dir"]).expanduser()
+    memory_md = Path(config["memory_md"]).expanduser()
+    mem_cfg = config["memory"]
+
+    files: List[Tuple[Path, str, Optional[str], str]] = []
+
+    if memory_md.exists():
+        files.append((memory_md, "shared", None, "memory_md"))
+
+    lessons = memory_dir / mem_cfg["lessons_file"]
+    if lessons.exists():
+        files.append((lessons, "shared", None, "lessons"))
+
+    handbook_dir = memory_dir / mem_cfg["handbook_dir"]
+    if handbook_dir.exists():
+        for p in handbook_dir.rglob("*.md"):
+            files.append((p, "shared", None, "handbook"))
+
+    archives_dir = memory_dir / mem_cfg["archives_dir"]
+    if archives_dir.exists():
+        for p in archives_dir.rglob("*.md"):
+            files.append((p, "shared", None, "archive"))
+
+    for p in _collect_glob(memory_dir, mem_cfg["daily_globs"]):
+        if p.is_file() and p.suffix == ".md" and p.name != lessons.name and "archives" not in p.parts and "handbook" not in p.parts and "agents" not in p.parts:
+            files.append((p, "shared", None, "daily"))
+
+    agents_root = memory_dir / mem_cfg["agents_dir"]
+    if scope == "all" and agents_root.exists():
+        for p in agents_root.rglob("*.md"):
+            if len(p.relative_to(agents_root).parts) > 1:
+                files.append((p, "agent", p.relative_to(agents_root).parts[0], "agent"))
+    elif scope.startswith("agent:") and agents_root.exists():
+        name = scope.split(":", 1)[1]
+        for p in (agents_root / name).rglob("*.md"):
+            files.append((p, "agent", name, "agent"))
+    elif scope == "agent" and agent and agents_root.exists():
+        for p in (agents_root / agent).rglob("*.md"):
+            files.append((p, "agent", agent, "agent"))
+
+    seen = set()
+    results = []
+    for path, vis, ag, kind in files:
+        if not path.exists():
+            continue
+        if path in seen:
+            continue
+        seen.add(path)
+        if date_range and kind == "daily":
+            try:
+                d = datetime.strptime(path.stem, "%Y-%m-%d").date()
+                if not (date_range[0] <= d <= date_range[1]):
+                    continue
+            except ValueError:
+                pass
+        results.append({"path": path, "visibility": vis, "agent": ag, "kind": kind})
+
+    return sorted(results, key=lambda x: str(x["path"]))
+
+
+def estimate_tokens(text: str) -> int:
+    return max(1, len(text) // 4)
+
+
+def load_json(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
     try:
-        with open(index_path, 'r') as f:
-            return json.load(f)
-    except (json.JSONDecodeError, IOError):
-        return {"memories": {}, "last_updated": None, "version": "1.0"}
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
 
 
-def save_memory_index(memory_dir: Path, index: Dict[str, Any]) -> None:
-    """Save the memory scoring index."""
-    index_path = Path(memory_dir) / ".memory-index.json"
-    index["last_updated"] = datetime.now().isoformat()
-    
-    with open(index_path, 'w') as f:
-        json.dump(index, f, indent=2)
+def save_json(path: Path, obj: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(obj, indent=2), encoding="utf-8")
 
 
-def load_pipeline_log(memory_dir: Path) -> List[Dict[str, Any]]:
-    """Load pipeline execution log."""
-    log_path = Path(memory_dir) / ".pipeline-log.json"
-    if not log_path.exists():
-        return []
-    
-    try:
-        with open(log_path, 'r') as f:
-            return json.load(f)
-    except (json.JSONDecodeError, IOError):
-        return []
+# Backward-compatible helpers
+def get_memory_files(memory_dir: Path, date_range=None):
+    cfg = load_config()
+    cfg["memory_dir"] = str(Path(memory_dir))
+    return [e["path"] for e in gather_memory_files(cfg, scope="shared", date_range=date_range)]
 
+def read_memory_file(file_path: Path):
+    text = read_text(Path(file_path)) if Path(file_path).exists() else ""
+    st = Path(file_path).stat() if Path(file_path).exists() else None
+    return {"path": str(file_path), "content": text, "sections": {}, "size": (st.st_size if st else 0), "modified": datetime.fromtimestamp(st.st_mtime) if st else None, "created": datetime.fromtimestamp(st.st_ctime) if st else None}
 
-def save_pipeline_log(memory_dir: Path, log_entries: List[Dict[str, Any]]) -> None:
-    """Save pipeline execution log."""
-    log_path = Path(memory_dir) / ".pipeline-log.json"
-    
-    with open(log_path, 'w') as f:
-        json.dump(log_entries, f, indent=2)
+def write_memory_file(file_path: Path, content: str, backup: bool = True):
+    fp = Path(file_path)
+    if backup and fp.exists():
+        fp.with_suffix(fp.suffix+".bak").write_text(fp.read_text(encoding="utf-8"), encoding="utf-8")
+    write_text(fp, content)
 
+def load_memory_index(memory_dir: Path):
+    return load_json(Path(memory_dir)/".memory-index.json", {"memories": {}, "last_updated": None, "version": "1.0"})
 
-def append_pipeline_log(memory_dir: Path, entry: Dict[str, Any]) -> None:
-    """Append entry to pipeline log."""
-    log = load_pipeline_log(memory_dir)
-    entry["timestamp"] = datetime.now().isoformat()
+def save_memory_index(memory_dir: Path, index):
+    save_json(Path(memory_dir)/".memory-index.json", index)
+
+def append_pipeline_log(memory_dir: Path, entry):
+    p = Path(memory_dir)/".pipeline-log.json"
+    log = load_json(p, [])
+    entry["timestamp"] = datetime.utcnow().isoformat()+"Z"
     log.append(entry)
-    
-    # Keep only last 100 entries
-    if len(log) > 100:
-        log = log[-100:]
-    
-    save_pipeline_log(memory_dir, log)
+    save_json(p, log[-100:])
 
+def load_pipeline_log(memory_dir: Path):
+    return load_json(Path(memory_dir)/".pipeline-log.json", [])
 
-def find_session_files(session_dir: Path, target_date: Optional[date] = None) -> List[Path]:
-    """Find session JSONL files, optionally filtered by modification date."""
-    session_dir = Path(session_dir)
-    if not session_dir.exists():
-        return []
-    
-    session_files = []
-    for file_path in session_dir.glob("*.jsonl"):
-        if target_date:
-            # Check if file was modified on target date
-            mod_time = datetime.fromtimestamp(file_path.stat().st_mtime)
-            if mod_time.date() == target_date:
-                session_files.append(file_path)
-        else:
-            session_files.append(file_path)
-    
-    return sorted(session_files, key=lambda p: p.stat().st_mtime, reverse=True)
-
-
-def extract_text_content(content: Any) -> str:
-    """Extract text from message content (handles both string and list formats)."""
-    if isinstance(content, str):
-        return content
-
-    if isinstance(content, list):
-        text_parts = []
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
-                text_parts.append(block.get("text", ""))
-            elif isinstance(block, str):
-                text_parts.append(block)
-        return "\n".join(text_parts)
-
-    return str(content)
-
-
-def format_memory_snippet(content: str, query: str = "", max_chars: int = 300, context_lines: int = 2) -> str:
-    """Format a memory snippet with optional highlighting."""
-    lines = content.split('\n')
-    
-    if query:
-        # Find lines containing the query (case insensitive)
-        query_lower = query.lower()
-        matching_lines = []
-        
-        for i, line in enumerate(lines):
-            if query_lower in line.lower():
-                # Include context lines
-                start = max(0, i - context_lines)
-                end = min(len(lines), i + context_lines + 1)
-                matching_lines.extend(range(start, end))
-        
-        # Remove duplicates and sort
-        matching_lines = sorted(set(matching_lines))
-        
-        if matching_lines:
-            snippet_lines = [lines[i] for i in matching_lines]
-            snippet = '\n'.join(snippet_lines)
-        else:
-            # No matches, return beginning
-            snippet = '\n'.join(lines[:10])
-    else:
-        # No query, return beginning
-        snippet = '\n'.join(lines[:10])
-    
-    # Truncate if too long
-    if len(snippet) > max_chars:
-        snippet = snippet[:max_chars-3] + "..."
-    
-    return snippet
-
-
-def ensure_memory_dir(memory_dir: Path) -> None:
-    """Ensure memory directory exists."""
-    memory_dir = Path(memory_dir)
-    memory_dir.mkdir(parents=True, exist_ok=True)
+def save_pipeline_log(memory_dir: Path, log_entries):
+    save_json(Path(memory_dir)/".pipeline-log.json", log_entries)
