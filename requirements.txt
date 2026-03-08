@@ -1,0 +1,6 @@
+faiss-cpu
+numpy
+pyyaml
+sqlite-utils
+ollama
+rank-bm25

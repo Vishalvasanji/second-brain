@@ -1,0 +1,5 @@
+.index/
+*.sqlite
+*.faiss
+__pycache__/
+*.pyc
